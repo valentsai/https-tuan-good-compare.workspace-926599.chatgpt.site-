@@ -1,0 +1,38 @@
+const MAX_BYTES = 1500000;
+const clean = value => String(value ?? '').replace(/<[^>]*>/g, ' ').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&#(\d+);/g, (_, n) => Number(n) <= 0x10ffff ? String.fromCodePoint(Number(n)) : '').replace(/\s+/g, ' ').trim().slice(0, 1000);
+export function publicUrl(value) {
+  let u; try { u = new URL(value); } catch { throw Error('請輸入完整的商品網址'); }
+  const host=u.hostname.toLowerCase().replace(/\.$/, '');
+  if (!['https:', 'http:'].includes(u.protocol) || u.username || u.password || (u.port && !['80','443'].includes(u.port)) || !host.includes('.') || /[^a-z0-9.-]/.test(host) || /^[\d.]+$/.test(host) || /(^|\.)(localhost|local|internal|test|invalid|example|onion|arpa|nip\.io|sslip\.io|localtest\.me|lvh\.me)$/.test(host) || host==='metadata.google.internal') throw Error('請使用公開團購網站的 http 或 https 網址');
+  u.hash=''; return u;
+}
+function attrs(tag) { const result={}; for (const m of tag.matchAll(/([^\s=<>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) result[m[1].toLowerCase()]=clean(m[2]??m[3]??m[4]); return result; }
+function valueText(v) {return clean(typeof v==='object'&&v ? v.name??v.value??'' : v);}
+function number(v){const n=Number(String(v??'').replace(/,/g,'').trim());return Number.isFinite(n)&&n>0&&n<=100000000?n:null;}
+export function extractProduct(html) {
+  const meta={};for(const tag of html.match(/<meta\b[^>]*>/gi)||[]){const a=attrs(tag);if(a.property||a.name)meta[(a.property||a.name).toLowerCase()]=a.content||'';}
+  const found=[];let visited=0;function walk(o){if(!o||typeof o!=='object'||++visited>5000)return;if((Array.isArray(o['@type'])?o['@type']:[o['@type']]).some(t=>/(^|\/)Product$/.test(String(t))))found.push(o);for(const v of Object.values(o))if(v&&typeof v==='object'){if(Array.isArray(v))v.forEach(walk);else walk(v)}}
+  for(const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)){if(attrs(script[1]).type?.toLowerCase()==='application/ld+json'){try{walk(JSON.parse(script[2].trim().replace(/^<!--|-->$/g,'')))}catch{}}}
+  const warnings=[];const p=found.length===1?found[0]:{};if(found.length>1)warnings.push('頁面含多件商品，請確認商品名稱與規格；價格未自動選取。');
+  const data={name:valueText(p.name)||meta['og:title']||clean(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]),brand:valueText(p.brand)||meta['product:brand']||'',pack:'',source:meta['og:site_name']||'',price:null,weight:null,measure:'g',currency:''};
+  let offers=Array.isArray(p.offers)?p.offers:p.offers?[p.offers]:[];let offer=offers.length===1?offers[0]:{};
+  if(Array.isArray(offer.offers)){offer=offer.offers.length===1?offer.offers[0]:{};warnings.push('頁面含多種商品選項，請確認價格。');}
+  const specification=Array.isArray(offer.priceSpecification)?offer.priceSpecification[0]:offer.priceSpecification;
+  data.currency=clean(offer.priceCurrency||specification?.priceCurrency||meta['product:price:currency']||meta['og:price:currency']).toUpperCase();
+  const amount=offer.price??specification?.price??meta['product:price:amount']??meta['og:price:amount'];
+  if(found.length<=1&&['TWD','NTD'].includes(data.currency))data.price=number(amount);
+  else if(amount)warnings.push(data.currency?'售價不是新台幣，請自行換算後填入。':'網站未標示幣別，請確認新台幣價格後填入。');
+  if(offers.length>1)warnings.push('頁面有多種售價，請選定規格後自行填價。');
+  const properties=Array.isArray(p.additionalProperty)?p.additionalProperty:p.additionalProperty?[p.additionalProperty]:[];
+  const packaging=properties.find(a=>/包裝|規格|容量|淨重|重量|尺寸|packaging|package|size/i.test(a.name||''));
+  data.pack=valueText(packaging?.value)||valueText(p.size)||'';
+  const w=p.weight;if(w&&typeof w==='object'){const unit=String(w.unitCode||w.unitText||'').toLowerCase();const units={grm:['g',1],g:['g',1],'公克':['g',1],kgm:['g',1000],kg:['g',1000],'公斤':['g',1000],mlt:['ml',1],ml:['ml',1],ltr:['ml',1000],l:['ml',1000]};if(units[unit]&&number(w.value)){data.weight=number(w.value)*units[unit][1];data.measure=units[unit][0];}}
+  if(!data.pack){const description=clean(p.description||meta['og:description']||'');const match=(data.name+' '+description).match(/\d+(?:\.\d+)?\s*(?:kg|ml|g|公克|公斤|毫升|公升|克|L)(?:\s*[×xX*＊]\s*\d+\s*(?:入|包|袋|瓶|盒|罐)?)?/i);if(match){data.pack=match[0];warnings.push('包裝規格由商品文字擷取，請確認整組重量。');}}
+  for(const key of ['name','brand','pack','source'])data[key]=clean(data[key]).slice(0,key==='name'||key==='pack'?80:60);
+  if(!data.name&&!data.price&&!data.brand)throw Error('這個網站未提供可讀取的商品資訊，請改為手動填寫');
+  return {data,warnings,fields:Object.entries(data).filter(([k,v])=>['name','brand','pack','price','weight'].includes(k)&&v).map(([k])=>k)};
+}
+async function readLimited(response){if(Number(response.headers.get('content-length'))>MAX_BYTES)throw Error('商品頁面過大，請手動填寫');const reader=response.body.getReader();let chunks=[],total=0;try{while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>MAX_BYTES)throw Error('商品頁面過大，請手動填寫');chunks.push(value)}}finally{await reader.cancel().catch(()=>{})}const all=new Uint8Array(total);let offset=0;for(const chunk of chunks){all.set(chunk,offset);offset+=chunk.length}const charset=response.headers.get('content-type')?.match(/charset=([^;\s]+)/i)?.[1]||'utf-8';try{return new TextDecoder(charset).decode(all)}catch{return new TextDecoder().decode(all)}}
+export async function importProduct(value,siteOrigin,fetcher=fetch){let url=publicUrl(value);const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),10000);try{for(let i=0;i<5;i++){if(url.origin===siteOrigin)throw Error('請貼上其他團購網站的商品網址');const response=await fetcher(url.href,{redirect:'manual',signal:controller.signal,headers:{Accept:'text/html,application/xhtml+xml','Accept-Language':'zh-TW,zh;q=0.9'}});if(response.status>=300&&response.status<400){const location=response.headers.get('location');await response.body?.cancel();if(!location)throw Error('商品網址無法開啟');url=publicUrl(new URL(location,url).href);continue}if(!response.ok)throw Error('網站拒絕讀取或需要登入，請手動填寫');if(!/text\/html|application\/xhtml\+xml/i.test(response.headers.get('content-type')||''))throw Error('請提供商品網頁網址，不能使用圖片或檔案連結');const result=extractProduct(await readLimited(response));result.data.source=result.data.source||url.hostname;return {...result,url:url.href}}throw Error('網址轉址過多，請使用最終商品網址')}finally{clearTimeout(timeout)}}
+const json=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+export default {async fetch(request){const url=new URL(request.url);if(url.pathname==='/api/product-info'){if(request.method!=='POST')return json({error:'請使用商品表單貼上網址'},405);if(request.headers.get('origin')&&request.headers.get('origin')!==url.origin)return json({error:'不支援跨網站呼叫'},403);try{if(!request.headers.get('content-type')?.includes('application/json'))return json({error:'請使用商品表單'},400);const text=await request.text();if(text.length>8000)return json({error:'網址過長'},400);const input=JSON.parse(text);if(typeof input.url!=='string'||input.url.length>2000)return json({error:'請輸入有效商品網址'},400);return json(await importProduct(input.url,url.origin))}catch(error){return json({error:error.name==='AbortError'?'讀取逾時，請稍後再試或手動填寫':error.message||'無法讀取，請手動填寫'},422)}}if(!['GET','HEAD'].includes(request.method))return new Response('Method not allowed',{status:405});const key=url.pathname==='/'?'/index.html':url.pathname;const asset=STATIC_FILES[key];if(!asset)return new Response('Not found',{status:404});return new Response(request.method==='HEAD'?null:asset.body,{headers:{'Content-Type':asset.type,'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin'}})}};
